@@ -7,6 +7,7 @@
 #include <ATen/cpu/vml.h>
 #include <ATen/native/IndexingUtils.h>
 #include <ATen/native/cpu/GridSamplerKernel.h>
+#include <ATen/native/UpSample.h>
 #include <c10/util/Exception.h>
 
 namespace at { namespace native {
@@ -483,6 +484,36 @@ Tensor _grid_sampler_2d_cpu_fallback(const Tensor& input, const Tensor& grid,
                 *out_ptr_NCHW = static_cast<scalar_t>(0);
               }
             }
+          } else if (interpolation_mode == GridSamplerInterpolation::Bicubic) {
+            int64_t ix_nw = static_cast<int64_t>(std::floor(ix));
+            int64_t iy_nw = static_cast<int64_t>(std::floor(iy));
+
+            const scalar_t tx = ix - ix_nw;
+            const scalar_t ty = iy - iy_nw;
+
+            scalar_t *inp_ptr_NC = inp_ptr_N;
+            scalar_t *out_ptr_NCHW = out_ptr + n * out_sN + h * out_sH + w * out_sW;
+            for (int64_t c = 0; c < C; ++c, out_ptr_NCHW += out_sC, inp_ptr_NC += inp_sC) {
+              scalar_t coefficients[4];
+
+              // Interpolate 4 values the in the x directon
+              for (int64_t i = 0; i < 4; i++) {
+                coefficients[i] = cubic_interp1d<scalar_t>(
+                  upsample_get_value_bounded<scalar_t>(inp_ptr_NC, inp_W, inp_H, ix_nw - 1, iy_nw - 1 + i),
+                  upsample_get_value_bounded<scalar_t>(inp_ptr_NC, inp_W, inp_H, ix_nw + 0, iy_nw - 1 + i),
+                  upsample_get_value_bounded<scalar_t>(inp_ptr_NC, inp_W, inp_H, ix_nw + 1, iy_nw - 1 + i),
+                  upsample_get_value_bounded<scalar_t>(inp_ptr_NC, inp_W, inp_H, ix_nw + 2, iy_nw - 1 + i),
+                  tx);
+              }
+
+              // Interpolate in y direction
+              *out_ptr_NCHW = cubic_interp1d<scalar_t>(
+                coefficients[0],
+                coefficients[1],
+                coefficients[2],
+                coefficients[3],
+                ty);
+            }
           }
         }
       }
@@ -627,6 +658,33 @@ _grid_sampler_2d_cpu_fallback_backward(const Tensor& grad_output,
               // calculate and set grad_input
               safe_add_2d(gInp_ptr_NC, iy_nearest, ix_nearest, gInp_sH, gInp_sW,
                           inp_H, inp_W, *gOut_ptr_NCHW);
+            }
+          } else if (interpolation_mode == GridSamplerInterpolation::Bicubic) {
+            int64_t ix_nw = static_cast<int64_t>(std::floor(ix));
+            int64_t iy_nw = static_cast<int64_t>(std::floor(iy));
+
+            const scalar_t tx = ix - ix_nw;
+            const scalar_t ty = iy - iy_nw;
+
+            scalar_t x_coeffs[4];
+            scalar_t y_coeffs[4];
+
+            get_cubic_upsample_coefficients<scalar_t>(x_coeffs, tx);
+            get_cubic_upsample_coefficients<scalar_t>(y_coeffs, ty);
+
+            scalar_t *gOut_ptr_NCHW = gOut_ptr + n * gOut_sN + h * gOut_sH + w * gOut_sW;
+            scalar_t gOut = *gOut_ptr_NCHW;
+
+            for (int64_t i = 0; i < 4; i++) {
+              for (int64_t j = 0; j < 4; j++) {
+                upsample_increment_value_bounded<scalar_t>(
+                  inp_ptr_N,
+                  inp_W,
+                  inp_H,
+                  ix_nw - 1 + i,
+                  iy_nw - 1 + j,
+                  gOut * y_coeffs[j] * x_coeffs[i]);
+              }
             }
           }
         }
